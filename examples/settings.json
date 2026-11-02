@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$HOME/.local/bin/never_miss.py\" hook",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}
