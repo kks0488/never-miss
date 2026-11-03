@@ -47,7 +47,7 @@ class NeverMissTests(unittest.TestCase):
 
     def inbox(self):
         path = self.root / "inbox.jsonl"
-        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+        return [json.loads(line) for line in path.read_text().split("\n") if line] if path.exists() else []
 
     def config(self, value):
         self.root.mkdir(parents=True, exist_ok=True)
@@ -338,6 +338,337 @@ class NeverMissTests(unittest.TestCase):
         self.assertEqual((self.root.stat().st_mode & 0o777), 0o700)
         for name in ("inbox.jsonl", ".lock"):
             self.assertEqual(((self.root / name).stat().st_mode & 0o777), 0o600)
+
+
+    def test_redaction_is_optional_and_preserves_layout(self):
+        secret = "Example" + "Password42!"
+        said = f"  password: {secret}\n\tkeep this  "
+        self.hook(said, prompt_id="unmasked")
+        self.config({"redact_secrets": True})
+        self.hook(said, prompt_id="masked")
+        self.assertEqual(self.inbox()[0]["said"], said)
+        self.assertEqual(self.inbox()[1]["said"], "  password: [REDACTED]\n\tkeep this  ")
+        self.assertEqual(len(self.inbox()), 2)
+
+    def test_redaction_patterns_and_luhn_false_positive(self):
+        card = "4111 " + "1111 " * 2 + "1111"
+        rrn = "900101" + "-1234567"
+        key = "sk-" + "a1B2" * 8
+        said = f"{card}\n{rrn}\n{key}\n비밀번호='sample value'"
+        self.config({"redact_secrets": True})
+        self.hook(said)
+        self.assertEqual(self.inbox()[0]["said"],
+                         "[REDACTED]\n[REDACTED]\n[REDACTED]\n비밀번호=[REDACTED]")
+        self.assertEqual(APP.redact("4111 1111 1111 1112"), "4111 1111 1111 1112")
+        self.assertEqual(APP.redact("password:\nordinary instruction"),
+                         "password:\nordinary instruction")
+        self.assertEqual(APP.redact("passwords reviewed"), "passwords reviewed")
+        self.assertEqual(APP.redact(APP.redact(said)), APP.redact(said))
+
+    def test_redaction_masks_password_before_hint(self):
+        secret = "Mixed" + "Case123!"
+        self.assertEqual(APP.redact(f"({secret}) for login"), "([REDACTED]) for login")
+        self.assertEqual(APP.redact("ORDER123456 for login"), "ORDER123456 for login")
+
+    def test_redacted_replay_keeps_id_and_has_no_raw_text_in_state(self):
+        self.config({"redact_secrets": True})
+        secret = "Private" + "Value123!"
+        self.hook(f"password={secret}", prompt_id="secret-input")
+        self.hook(f"password={secret}", prompt_id="secret-input")
+        self.assertEqual(len(self.inbox()), 1)
+        for path in self.root.iterdir():
+            if path.is_file():
+                self.assertNotIn(secret, path.read_text())
+
+    def test_invalid_redaction_config_is_silent_and_logged(self):
+        self.config({"redact_secrets": "yes"})
+        self.hook()
+        self.assertEqual(self.inbox(), [])
+        self.assertTrue((self.root / "errors.jsonl").exists())
+
+    def ledger(self, entries):
+        path = Path(self.temp.name) / "ledger.json"
+        path.write_text(json.dumps({"sessions": entries}))
+        return path
+
+    def test_session_ledger_tracks_changed_session(self):
+        ledger = self.ledger([{"name": "primary", "session_id": "session-alpha"},
+                              {"name": "other", "session_id": "session-other"}])
+        self.config({"session_ledger": str(ledger), "session_names": ["primary"]})
+        self.hook("First")
+        self.hook("Not selected", session_id="session-other")
+        self.ledger([{"name": "primary", "session_id": "session-new"}])
+        self.hook("Old session")
+        self.hook("New session", session_id="session-new")
+        self.assertEqual([r["said"] for r in self.inbox()], ["First", "New session"])
+
+    def test_ledger_no_match_missing_and_invalid_fail_closed(self):
+        ledger = self.ledger([{"name": "other", "session_id": "session-other"}])
+        self.config({"session_ledger": str(ledger), "session_names": ["primary"]})
+        self.hook()
+        ledger.write_text("{bad")
+        self.hook()
+        ledger.unlink()
+        self.hook()
+        self.assertEqual(self.inbox(), [])
+        self.assertEqual(len(APP.rows(self.root / "errors.jsonl")), 3)
+
+    def test_channel_body_only_for_explicit_sessions(self):
+        self.config({"channel_sessions": ["watch-session"]})
+        body = "  Please review\n\tthis  "
+        envelope = f'<channel sender="example">{body}</channel>'
+        self.hook(envelope, session_id="watch-session", prompt_id="body")
+        self.hook("Timer fired", session_id="watch-session")
+        self.hook('<channel><task-notification>done</channel>', session_id="watch-session")
+        self.hook(envelope, session_id="session-alpha")
+        self.assertEqual([r["said"] for r in self.inbox()], [body, envelope])
+
+    def test_channel_body_redaction_and_replay(self):
+        self.config({"channel_sessions": ["watch-session"], "redact_secrets": True})
+        for _ in range(2):
+            self.hook('<channel> password: example-value </channel>',
+                      session_id="watch-session", prompt_id="channel-input")
+        self.assertEqual([r["said"] for r in self.inbox()], [" password: [REDACTED] "])
+
+    def test_source_scopes_local_retry_and_prompt_identity(self):
+        for source in ("desktop", "laptop"):
+            self.config({"source": source})
+            self.hook(prompt_id="same-id")
+            self.hook(prompt_id="same-id")
+        self.assertEqual(len(self.inbox()), 2)
+        self.assertEqual({r["source"] for r in self.inbox()}, {"desktop", "laptop"})
+        self.assertEqual(len({r["id"] for r in self.inbox()}), 2)
+
+    def import_row(self, **changes):
+        return {"id": "origin-1", "t": "2031-05-06T12:00:00.000001+00:00",
+                "said": "  Keep\nthis\u2028text  ", "session": "remote-session", "cwd": "", **changes}
+
+    def test_collect_replays_preserve_time_text_and_source_scope(self):
+        raw = json.dumps(self.import_row()) + "\n"
+        for source in ("desktop", "laptop"):
+            for _ in range(2):
+                result = self.cli("collect", "--source", source, raw=raw)
+                self.assertEqual(result.returncode, 0, result.stderr)
+        records = self.inbox()
+        self.assertEqual(len(records), 2)
+        self.assertEqual({r["said"] for r in records}, {self.import_row()["said"]})
+        self.assertEqual({r["t"] for r in records}, {self.import_row()["t"]})
+        self.assertEqual(len({r["key"] for r in records}), 2)
+
+    def test_collect_native_inbox_jsonl(self):
+        self.hook("From another machine", prompt_id="native-input")
+        raw = (self.root / "inbox.jsonl").read_text()
+        remote = Path(self.temp.name) / "collector"
+        env = dict(self.env, NEVER_MISS_DIR=str(remote))
+        for _ in range(2):
+            result = self.cli("collect", "--source", "laptop", raw=raw, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        records = APP.rows(remote / "inbox.jsonl")
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["said"], "From another machine")
+
+    def test_collect_validates_whole_batch_before_writing(self):
+        for bad in ("{broken", "[]", json.dumps(self.import_row(id=2)),
+                    json.dumps(self.import_row(t="2031-05-06T12:00:00")),
+                    json.dumps(self.import_row(cwd=[]))):
+            with self.subTest(bad=bad):
+                result = self.cli("collect", "--source", "laptop",
+                                  raw=json.dumps(self.import_row()) + "\n" + bad + "\n")
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(self.inbox(), [])
+                self.assertNotIn(self.import_row()["said"], result.stderr)
+        self.assertEqual(self.cli("collect", "--source", " ", raw="").returncode, 1)
+
+    def test_collect_filters_and_redacts_before_writing(self):
+        self.config({"sessions": ["remote-session"], "redact_secrets": True})
+        inputs = [self.import_row(said="password=example-value"),
+                  self.import_row(id="origin-2", said="<task-notification>done"),
+                  self.import_row(id="origin-3", session="unselected")]
+        raw = "\n".join(json.dumps(r) for r in inputs) + "\n"
+        self.assertEqual(self.cli("collect", "--source", "laptop", raw=raw).returncode, 0)
+        self.assertEqual([r["said"] for r in self.inbox()], ["password=[REDACTED]"])
+
+    def test_collect_concurrent_replay_saved_once(self):
+        raw = json.dumps(self.import_row()) + "\n"
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(lambda _: self.cli("collect", "--source", "laptop", raw=raw), range(8)))
+        self.assertTrue(all(r.returncode == 0 for r in results))
+        self.assertEqual(len(self.inbox()), 1)
+
+    def receiver(self, code, **config):
+        path = Path(self.temp.name) / "receiver.py"
+        path.write_text(code)
+        self.config({"export_command": [sys.executable, str(path)], **config})
+        return path
+
+    def test_dispatch_acks_once_and_preserves_inbox_and_done(self):
+        received = Path(self.temp.name) / "received.jsonl"
+        self.receiver("import json, os, sys\nfrom pathlib import Path\n"
+                      "entry = json.load(sys.stdin)\n"
+                      "assert entry['idempotency_key'] == os.environ['NEVER_MISS_IDEMPOTENCY_KEY']\n"
+                      f"with Path({str(received)!r}).open('a') as f: f.write(json.dumps(entry) + '\\n')\n")
+        marker = Path(self.temp.name) / "must-not-exist"
+        self.hook(f"Use literal $(touch {marker})\nthen review")
+        original = (self.root / "inbox.jsonl").read_bytes()
+        for _ in range(2):
+            result = self.cli("dispatch")
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(APP.rows(received)), 1)
+        self.assertFalse(marker.exists())
+        self.assertEqual((self.root / "inbox.jsonl").read_bytes(), original)
+        self.assertFalse((self.root / "done.jsonl").exists())
+        for name in ("outbox.jsonl", "deliveries.jsonl", ".dispatch.lock"):
+            self.assertEqual((self.root / name).stat().st_mode & 0o777, 0o600)
+
+    def test_dispatch_failure_then_retry_keeps_token(self):
+        path = self.receiver("import sys\nsys.exit(7)\n")
+        self.hook()
+        first = self.cli("dispatch")
+        self.assertEqual(first.returncode, 1)
+        self.assertIn("pending 1", first.stdout)
+        path.write_text("import json, sys\njson.load(sys.stdin)\n")
+        self.assertEqual(self.cli("dispatch").returncode, 0)
+        events = APP.rows(self.root / "deliveries.jsonl")
+        self.assertEqual([r["status"] for r in events], ["failed", "sent"])
+        self.assertEqual(len({r["idempotency_key"] for r in events}), 1)
+        self.assertEqual(len(APP.rows(self.root / "outbox.jsonl")), 1)
+
+    def test_dispatch_timeout_missing_command_and_no_output_leak(self):
+        path = self.receiver("import time\ntime.sleep(5)\n", export_timeout=0.05)
+        self.hook()
+        self.assertEqual(self.cli("dispatch").returncode, 1)
+        self.assertIn("unknown", APP.rows(self.root / "deliveries.jsonl")[0]["detail"])
+        path.write_text("import sys\nprint('private receiver output')\n"
+                        "print('private error output', file=sys.stderr)\nsys.exit(3)\n")
+        result = self.cli("dispatch")
+        self.assertNotIn("private", result.stdout + result.stderr)
+        self.config({"export_command": [str(Path(self.temp.name) / "missing-command")]})
+        self.assertEqual(self.cli("dispatch").returncode, 1)
+        self.assertEqual(len(APP.rows(self.root / "deliveries.jsonl")), 3)
+
+    def test_dispatch_configuration_validation(self):
+        for value in ({}, {"export_command": "echo unsafe"}, {"export_command": []},
+                      {"export_command": ["echo"], "export_timeout": 0},
+                      {"export_command": ["echo"], "export_timeout": True}):
+            self.config(value)
+            self.assertEqual(self.cli("dispatch").returncode, 1)
+        self.assertFalse((self.root / "outbox.jsonl").exists())
+
+    def test_dispatch_repairs_missing_queue_from_durable_inbox(self):
+        self.hook("Captured before export was configured")
+        self.receiver("import json, sys\njson.load(sys.stdin)\n")
+        self.assertEqual(self.cli("dispatch").returncode, 0)
+        self.assertEqual(len(APP.rows(self.root / "outbox.jsonl")), 1)
+        self.assertEqual(len(APP.rows(self.root / "deliveries.jsonl")), 1)
+
+    def test_dispatch_does_not_run_from_capture_or_preview_export(self):
+        marker = Path(self.temp.name) / "executed"
+        self.receiver(f"from pathlib import Path\nPath({str(marker)!r}).touch()\n")
+        self.hook()
+        self.cli("export", "--format", "markdown")
+        self.assertFalse(marker.exists())
+        self.assertEqual(self.cli("dispatch").returncode, 0)
+        self.assertTrue(marker.exists())
+
+    def test_dispatch_does_not_hold_capture_lock_and_serializes_senders(self):
+        started = Path(self.temp.name) / "started"
+        received = Path(self.temp.name) / "received"
+        self.receiver("import time\nfrom pathlib import Path\n"
+                      f"Path({str(started)!r}).touch()\n"
+                      "time.sleep(1.5)\n"
+                      f"with Path({str(received)!r}).open('a') as f: f.write('received\\n')\n")
+        self.hook("First")
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            first = pool.submit(self.cli, "dispatch")
+            import time
+            limit = time.monotonic() + 3
+            while not started.exists() and time.monotonic() < limit:
+                time.sleep(0.01)
+            self.assertTrue(started.exists())
+            self.hook("Captured during dispatch")
+            second = self.cli("dispatch")
+            self.assertEqual(second.returncode, 1)
+            self.assertIn("lock unavailable", second.stderr)
+            self.assertEqual(first.result().returncode, 0)
+        self.assertEqual(len(self.inbox()), 2)
+        self.assertEqual(received.read_text(), "received\n")
+
+    def test_dispatch_crash_after_receiver_success_requires_receiver_dedup(self):
+        self.receiver("import json, sys\njson.load(sys.stdin)\n")
+        self.hook()
+        real_append = APP.append
+        seen = set()
+        calls = []
+
+        def receive(*args, **kwargs):
+            entry = json.loads(kwargs["input"])
+            calls.append(entry["idempotency_key"])
+            seen.add(entry["idempotency_key"])
+            return subprocess.CompletedProcess(args[0], 0)
+
+        def crash(path, row):
+            if path.name == "deliveries.jsonl":
+                raise OSError("simulated crash before receipt")
+            return real_append(path, row)
+
+        with patch.object(APP.subprocess, "run", side_effect=receive):
+            with patch.object(APP, "append", side_effect=crash):
+                with self.assertRaises(OSError):
+                    APP.dispatch(self.root)
+            with patch("builtins.print"):
+                APP.dispatch(self.root)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(calls[0], calls[1])
+
+
+    def test_collect_utc_z_and_partial_storage_failure_replay(self):
+        import io
+        raw = "\n".join(json.dumps(self.import_row(id=f"input-{i}",
+                            t=f"2031-05-06T12:00:0{i}Z")) for i in range(2)) + "\n"
+        real_append = APP.append
+        count = 0
+
+        def fail_second(path, row):
+            nonlocal count
+            count += 1
+            if count == 2:
+                raise OSError("storage failure")
+            return real_append(path, row)
+
+        with patch.object(APP, "append", side_effect=fail_second):
+            with self.assertRaises(OSError):
+                APP.collect(io.StringIO(raw), self.root, "laptop")
+        self.assertEqual(len(self.inbox()), 1)
+        self.assertEqual(self.cli("collect", "--source", "laptop", raw=raw).returncode, 0)
+        self.assertEqual(len(self.inbox()), 2)
+        self.assertEqual(len(json.loads(self.cli("list", "--since", "999w", "--json").stdout)), 2)
+
+    def test_collect_key_conflict_rejects_batch_without_writes(self):
+        raw = "\n".join(json.dumps(self.import_row(id=f"input-{i}")) for i in range(2)) + "\n"
+        self.assertEqual(self.cli("collect", "--source", "laptop", raw=raw).returncode, 1)
+        self.assertEqual(self.inbox(), [])
+
+    def test_dispatch_failure_does_not_block_other_pending_entries(self):
+        self.receiver("import json, sys\nentry = json.load(sys.stdin)\n"
+                      "sys.exit(4 if entry['record']['said'] == 'Fail' else 0)\n")
+        self.hook("Fail")
+        self.hook("Succeed")
+        self.assertEqual(self.cli("dispatch").returncode, 1)
+        events = APP.rows(self.root / "deliveries.jsonl")
+        self.assertEqual([r["status"] for r in events], ["failed", "sent"])
+        self.assertEqual(self.cli("dispatch").returncode, 1)
+        self.assertEqual(len(APP.rows(self.root / "deliveries.jsonl")), 3)
+
+    def test_dispatch_corrupt_outbox_is_preserved_without_execution(self):
+        marker = Path(self.temp.name) / "must-not-execute"
+        self.receiver(f"from pathlib import Path\nPath({str(marker)!r}).touch()\n")
+        self.hook()
+        path = self.root / "outbox.jsonl"
+        path.write_text("{broken")
+        self.assertEqual(self.cli("dispatch").returncode, 1)
+        self.assertEqual(path.read_text(), "{broken")
+        self.assertFalse(marker.exists())
 
 
 if __name__ == "__main__":
