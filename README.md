@@ -104,7 +104,7 @@ The built-in prefixes are defined in `DEFAULT_SKIP_PREFIXES` near the start of t
 
 ## Optional redaction, collection, and delivery
 
-Merge only the options you need into `config.json`:
+Just drop the options you actually need into `config.json`:
 
 ```json
 {
@@ -119,24 +119,24 @@ Merge only the options you need into `config.json`:
 }
 ```
 
-Redaction replaces likely identity numbers, Luhn-valid card numbers, common access keys, labelled passwords, and password-like words near login hints with `[REDACTED]` before saving. Other whitespace is preserved. This heuristic can miss secrets or mask ordinary text. It checks prompt text only. Values cannot be recovered, and existing records are never retroactively redacted, including before delivery.
+Before anything is saved, redaction swaps out likely identity numbers, Luhn-valid card numbers, common access keys, labelled passwords, and password-like strings near login hints with `[REDACTED]`, leaving the rest of the whitespace alone. Since this relies on heuristics, it can still miss secrets or accidentally mask normal text, and it only checks prompt text. Once values are redacted, they can't be recovered, and existing records are never redacted retroactively, even right before delivery.
 
-A ledger looks like `{"sessions":[{"name":"primary","session_id":"session-alpha"}]}`. It is reread on capture; selected IDs extend explicit and environment session allowlists. An unreadable ledger or an empty combined selection skips capture and logs an error. Replace ledgers atomically. `channel_sessions` keeps only `<channel ...>body</channel>` bodies in listed sessions, preserving their whitespace and joining multiple bodies with a newline. No body means no capture there. Normal filters still apply; this does not authenticate senders.
+Ledger files look like `{"sessions":[{"name":"primary","session_id":"session-alpha"}]}`. The file is re-read on every capture, and the selected IDs get added to your explicit and environment session allowlists. If the ledger can't be read or the combined session list ends up empty, capture is skipped and an error is logged. Make sure you replace ledger files atomically. For any session listed in `channel_sessions`, we only keep the body inside `<channel ...>body</channel>` tags (preserving its whitespace and joining multiple bodies with a newline). If there's no body tag, nothing gets captured for that entry. Normal filters still apply, and tags don't authenticate the sender.
 
-Transfer another machine's complete inbox snapshot through your trusted transport, verify transfer success, then run:
+To pull in records from another machine, copy its full inbox snapshot over your own trusted transport, make sure the transfer finished cleanly, and run:
 
 ```sh
 python3 never_miss.py collect --source laptop < laptop-inbox.jsonl
 python3 never_miss.py dispatch
 ```
 
-`collect` accepts JSONL with nonempty string `id`, timezone-aware ISO `t`, and `said`; optional `session` and `cwd` are strings. Native inbox files work directly. Filters and redaction apply. Time and text stay intact; IDs and keys are namespaced by source. Use stable unique origin labels and immutable IDs. Replayed snapshots are ignored. Malformed batches are rejected before writes; replay resumes after partial storage failure. Completion flags are not imported. Do not circulate merged snapshots back to origins. Transport and transcript adapters remain external.
+`collect` expects JSONL lines with a non-empty string `id`, a timezone-aware ISO `t`, and `said`. The optional `session` and `cwd` fields have to be strings, and native inbox files work out of the box. Normal filters and redaction still run during collection. We keep the original timestamps and text intact, but namespace IDs and keys by source, so stick to stable, unique origin labels and immutable IDs. Replayed snapshots are safely ignored, and malformed batches get rejected before anything is written. If a write fails partway through, re-running the batch picks up right where the storage failure happened. Completion flags aren't imported, and you shouldn't copy merged snapshots back to the source machine. Transport and transcript adapters stay external.
 
-Local `source` also namespaces captured IDs and adds a `source` field; its key hashes JSON `[source,t,said]`. Omit it to keep the original schema. Changing labels creates new identities.
+Setting a local `source` also namespaces captured IDs, adds a `source` field, and hashes the JSON array `[source,t,said]` as the key. Leave `source` out if you want to keep the original schema, and keep in mind that changing source labels later will generate brand-new identities.
 
-`dispatch` recovers its separate outbox from all inbox records, including completed ones. It runs the argument array without a shell. Stdin is `{"idempotency_key":"never-miss:<id>","record":{...}}`; the token also appears in `NEVER_MISS_IDEMPOTENCY_KEY`. The command inherits the current directory and environment. Exit 0 acknowledges delivery; failures or timeouts retry on the next explicit dispatch. Output is discarded. Timeout defaults to 10 seconds, maximum 300. Delivery never marks instructions done and never runs inside capture.
+`dispatch` builds its own separate outbox from all inbox records (including completed ones) and runs `export_command` directly without a shell, inheriting your current directory and environment. It passes `{"idempotency_key":"never-miss:<id>","record":{...}}` to stdin and sets the same token in `NEVER_MISS_IDEMPOTENCY_KEY`. An exit code of 0 marks delivery as acknowledged, while errors or timeouts get retried the next time you run `dispatch`. Command output is ignored, and the timeout defaults to 10 seconds (up to a max of 300). Delivery never marks instructions as done and never runs inside capture.
 
-Keep credentials and service mappings private. The receiver must durably deduplicate tokens and return 0 only after acceptance: a crash after remote success can replay the same token. Local acknowledgements alone cannot guarantee one remote card. Use one collector and receiver per outbox; changing receivers does not replay acknowledgements. Schedule dispatch separately.
+Keep your credentials and service mappings private. Your receiver needs to durably deduplicate tokens and only return 0 after the remote side accepts the item. If it crashes right after a remote call succeeds, the same token can be replayed, so local acknowledgements alone won't prevent duplicate remote cards. Stick to one collector and receiver per outbox, remember that swapping receivers won't replay old acknowledgements, and schedule `dispatch` separately.
 
 ## Records and reliability
 
